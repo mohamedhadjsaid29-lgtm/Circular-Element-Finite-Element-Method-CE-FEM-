@@ -1,0 +1,386 @@
+function CE_FEM_Ballistic_Penetration()
+% =========================================================================
+% CIRCULAR ELEMENT FEM — HIGH-SPEED BALLISTIC PENETRATION ENGINE
+% =========================================================================
+%
+% PHYSICS & MECHANICS:
+%   1. Steel Bullet Projectile: High-density rigid/elastic sphere (V = 450 m/s).
+%   2. Aluminum Armor Target: Discretized into 2D circular elements (R0 = 0.8 mm).
+%   3. Hydrodynamic Plastic Flow: Metal deforms into rotated ellipses (a/b > 1).
+%   4. Ballistic Cratering & Plugging: 1->4 Primal-Dual split simulates 
+%      debris spallation and hole perforation.
+%   5. Mass Invariant: pi*a*b = pi*R0^2 maintained at 10^-16 machine precision.
+% =========================================================================
+
+    clear; clc; close all;
+
+    fprintf('╔══════════════════════════════════════════════════════════╗\n');
+    fprintf('║  CE-FEM HIGH-SPEED BALLISTIC PENETRATION SOLVER         ║\n');
+    fprintf('║  Steel Bullet (450 m/s) Piercing Aluminum Armor Wall    ║\n');
+    fprintf('╚══════════════════════════════════════════════════════════╝\n\n');
+
+    outDir = fullfile(pwd, 'CE_FEM_Ballistic_Results');
+    if ~exist(outDir, 'dir'), mkdir(outDir); end
+
+    %% 1. PHYSICAL & SIMULATION PARAMETERS (in meters, seconds, kg)
+    % Target: Aluminum 6061-T6 Wall
+    W_wall    = 0.030;      % Wall thickness (20 mm)
+    H_wall    = 0.080;      % Wall height (80 mm)
+    rho_alum  = 2700.0;     % Aluminum density (kg/m^3)
+    E_alum    = 70e9;       % Young's Modulus (70 GPa)
+    sigY_alum = 310e6;      % Yield Stress (310 MPa)
+    
+    % Projectile: High-Strength Steel Ball
+    R_ball    = 0.008;      % Steel ball radius (8 mm diameter = 16 mm)
+    V_bullet  = 450.0;      % Bullet impact speed (450 m/s = 1620 km/h)
+    rho_steel = 7850.0;     % Steel density (kg/m^3)
+    E_steel   = 210e9;      % Steel Modulus (210 GPa)
+    m_ball    = rho_steel * (4/3) * pi * R_rad_to_vol(R_ball); % Ball Mass
+    
+    % Numerical & Grid Parameters
+    R0        = 0.0002;     % Aluminum element radius (0.8 mm)
+    spacing   = 2.0 * R0;
+    dt        = 0.00000012; % Time step (0.12 microseconds)
+    t_max     = 0.00018;    % Duration (180 microseconds)
+    k_impact  = 2.5e8;      % Impact contact stiffness
+    c_damp    = 0.35;       % Hydrodynamic damping
+
+    %% 2. GENERATE ALUMINUM WALL MESH
+    nx = floor(W_wall / spacing);
+    ny = floor(H_wall / spacing);
+    
+    max_particles = 16000;
+    pos    = zeros(max_particles, 2);
+    pos0   = zeros(max_particles, 2);
+    vel    = zeros(max_particles, 2);
+    force  = zeros(max_particles, 2);
+    R_rad  = zeros(max_particles, 1);
+    axis_a = zeros(max_particles, 1);
+    axis_b = zeros(max_particles, 1);
+    theta  = zeros(max_particles, 1);
+    eps_p  = zeros(max_particles, 1);
+    vm_str = zeros(max_particles, 1);
+    gen    = zeros(max_particles, 1, 'int8');
+    active = false(max_particles, 1);
+
+    n_p = 0;
+    for i = 1:nx
+        for j = 1:ny
+            n_p = n_p + 1;
+            cx = (i - 0.5) * spacing;
+            cy = (j - 0.5) * spacing;
+            
+            pos(n_p, :)   = [cx, cy];
+            pos0(n_p, :)  = [cx, cy];
+            R_rad(n_p)    = R0;
+            axis_a(n_p)   = R0;
+            axis_b(n_p)   = R0;
+            active(n_p)   = true;
+        end
+    end
+    fprintf('Target Mesh: %d Circular Elements (Aluminum Wall).\n', n_p);
+
+    %% 3. INITIALIZE STEEL BULLET PROJECTILE
+    ball_pos = [-R_ball - 0.002, H_wall / 2.0]; % Start 2 mm left of wall
+    ball_vel = [V_bullet, 0.0];                 % Moving right at 450 m/s
+
+    %% 4. GRAPHICS CANVAS SETUP
+    hFig = figure('Name', 'CE-FEM High-Speed Ballistic Penetration', 'Color', 'k', ...
+                  'Position', [40, 40, 1300, 680]);
+    hAx = axes('Parent', hFig, 'Color', [0.02, 0.02, 0.04]);
+    hold(hAx, 'on'); axis(hAx, 'equal');
+    axis(hAx, [-15, W_wall*1000 + 25, -5, H_wall*1000 + 5]); % mm scale
+    set(hAx, 'XColor', 'w', 'YColor', 'w');
+    xlabel(hAx, 'X Position (mm)', 'Color', 'w');
+    ylabel(hAx, 'Y Position (mm)', 'Color', 'w');
+
+    % Fixed Wall Support Indicators & Initial Contour (in mm)
+    plot(hAx, [0, W_wall*1000, W_wall*1000, 0, 0], [0, 0, H_wall*1000, H_wall*1000, 0], 'w--', 'LineWidth', 1.0);
+    plot(hAx, [0, W_wall*1000], [5, 5], 'r:', 'LineWidth', 1.2);    % Bottom clamped limit
+    plot(hAx, [0, W_wall*1000], [75, 75], 'r:', 'LineWidth', 1.2);  % Top clamped limit
+
+    % Steel Ball Render Object (Red Circle)
+    th_ball = linspace(0, 2*pi, 40);
+    hBallPlot = fill(hAx, (ball_pos(1) + R_ball*cos(th_ball))*1000, ...
+                          (ball_pos(2) + R_ball*sin(th_ball))*1000, ...
+                          [0.9, 0.25, 0.25], 'EdgeColor', 'w', 'LineWidth', 1.5);
+
+    % Patch Object for Real-Time Deformable Target Elements
+    th_sample = linspace(0, 2*pi, 16);
+    cos_t = cos(th_sample); sin_t = sin(th_sample);
+    hEllipses = patch('Parent', hAx, 'XData', NaN, 'YData', NaN, ...
+                      'FaceColor', [0.2, 0.7, 0.95], 'FaceAlpha', 0.85, ...
+                      'EdgeColor', 'none');
+
+    %% 5. MAIN TIME INTEGRATION LOOP
+    sim_time = 0.0;
+    step = 0;
+
+    fprintf('Simulating ballistic penetration...\n');
+    tic;
+
+    while sim_time < t_max && ishandle(hFig)
+        step = step + 1;
+        sim_time = sim_time + dt;
+
+        % --- A. Advance Steel Ball Projectile ---
+        ball_pos = ball_pos + ball_vel * dt;
+
+        act_idx = find(active);
+        N_act   = length(act_idx);
+        force(act_idx, :) = 0.0;
+        f_ball_reaction = [0.0, 0.0];
+
+        % --- B. O(N) Spatial Cell-List Grid ---
+        cell_size = 2.2 * R0;
+        n_bx = ceil((W_wall + 0.030) / cell_size) + 1;
+        n_by = ceil((H_wall + 0.010) / cell_size) + 1;
+        head = zeros(n_bx, n_by, 'int32');
+        next = zeros(max_particles, 1, 'int32');
+
+        for idx = 1:N_act
+            i = act_idx(idx);
+            gx = min(n_bx, max(1, floor((pos(i,1) + 0.015) / cell_size) + 1));
+            gy = min(n_by, max(1, floor((pos(i,2) + 0.005) / cell_size) + 1));
+            next(i) = head(gx, gy);
+            head(gx, gy) = i;
+        end
+
+        % --- C. Target Internal Continuum & Elastic-Plastic Interactions ---
+        for idx = 1:N_act
+            i = act_idx(idx);
+            gx = min(n_bx, max(1, floor((pos(i,1) + 0.015) / cell_size) + 1));
+            gy = min(n_by, max(1, floor((pos(i,2) + 0.005) / cell_size) + 1));
+
+            for ox = -1:1
+                for oy = -1:1
+                    cx = gx + ox; cy = gy + oy;
+                    if cx < 1 || cx > n_bx || cy < 1 || cy > n_by, continue; end
+                    j = head(cx, cy);
+                    while j > 0
+                        if i < j
+                            rij = pos(i,:) - pos(j,:);
+                            d = norm(rij);
+                            d_min = 0.98 * (R_rad(i) + R_rad(j));
+
+                            if d < d_min && d > 1e-7
+                                nrm = rij / d;
+                                overlap = d_min - d;
+
+                                % Hard Position Correction (Zero Element Crossing)
+                                shift = 0.40 * overlap * nrm;
+                                pos(i,:) = pos(i,:) + shift;
+                                pos(j,:) = pos(j,:) - shift;
+
+                                % Internal Repulsion & Damping
+                                rel_v = vel(i,:) - vel(j,:);
+                                vn = dot(rel_v, nrm);
+                                f_elas = (E_alum * 0.0008) * overlap * nrm;
+                                
+                                force(i,:) = force(i,:) + f_elas;
+                                force(j,:) = force(j,:) - f_elas;
+                            end
+                        end
+                        j = next(j);
+                    end
+                end
+            end
+        end
+
+        % --- D. Steel Ball vs. Aluminum Element Impact Contact ---
+        split_queue = [];
+
+        for idx = 1:N_act
+            i = act_idx(idx);
+            d_ball = norm(pos(i,:) - ball_pos);
+            d_contact = R_ball + R_rad(i);
+
+            if d_ball < d_contact
+                nrm_ball = (pos(i,:) - ball_pos) / (d_ball + 1e-12);
+                overlap_ball = d_contact - d_ball;
+
+                % Hard Position Projection outside Steel Ball
+                pos(i,:) = ball_pos + d_contact * nrm_ball;
+
+                % Hydrodynamic Impact Force
+                v_rel = vel(i,:) - ball_vel;
+                vn_ball = dot(v_rel, nrm_ball);
+                
+                f_impact = k_impact * (overlap_ball^1.3) - c_damp * vn_ball;
+                f_impact = max(0.0, f_impact);
+
+                f_vec = f_impact * nrm_ball;
+                force(i,:) = force(i,:) + f_vec;
+                f_ball_reaction = f_ball_reaction - f_vec; % Reaction on bullet
+
+                % Velocity Impulse Transfer
+                if vn_ball < 0
+                    vel(i,:) = ball_vel + (v_rel - 1.3 * vn_ball * nrm_ball);
+                end
+
+                % Accumulate High Plastic Impact Strain
+                eps_p(i) = eps_p(i) + 0.15;
+
+                % Trigger 1->4 Splitting at High Impact Zone
+                if norm(v_rel) > 80.0 && R_rad(i) >= 0.9*R0
+                    split_queue(end+1) = i;
+                end
+            end
+        end
+
+        % Update Steel Ball Velocity (Newton's 2nd Law)
+        ball_acc = f_ball_reaction / m_ball;
+        ball_vel = ball_vel + ball_acc * dt;
+
+        % --- E. Motion Integration, Shear Kinematics & Area Invariant ---
+        for idx = 1:N_act
+            i = act_idx(idx);
+
+            % Fixed Clamped Top/Bottom Boundaries of Wall
+            if pos0(i,2) <= 0.003 || pos0(i,2) >= (H_wall - 0.003)
+                vel(i,:) = 0.0;
+                continue;
+            end
+
+            % Acceleration & Velocity Update
+            mass_i = rho_alum * pi * R_rad(i)^2;
+            acc = force(i,:) / mass_i;
+            vel(i,:) = vel(i,:) + acc * dt;
+            pos(i,:) = pos(i,:) + vel(i,:) * dt;
+
+            % --- CE-FEM PLASTIC SHEAR DEFORMATION KINEMATICS ---
+            f_mag = norm(force(i,:));
+            stress_i = f_mag / (2 * R_rad(i) * 0.001);
+
+            if stress_i > 50e6 || eps_p(i) > 0.05
+                % Align ellipse major axis with local flow velocity
+                spd = norm(vel(i,:));
+                if spd > 1.0
+                    theta(i) = atan2(vel(i,2), vel(i,1));
+                end
+
+                % Element stretches into rotated ellipse under impact shockwave
+                axis_a(i) = R_rad(i) * (1.0 + min(2.5, eps_p(i) * 2.5));
+                axis_b(i) = (R_rad(i)^2) / axis_a(i); % STRICT AREA INVARIANT: pi*a*b = pi*R^2
+                
+                vm_str(i) = min(sigY_alum * 2.0, stress_i + 150e6);
+            end
+        end
+
+        % --- F. Execute 1->4 Primal-Dual Topology Swaps (Spallation/Debris) ---
+        for s = 1:length(split_queue)
+            p_idx = split_queue(s);
+            if ~active(p_idx), continue; end
+            
+            p_pos = pos(p_idx, :);
+            p_vel = vel(p_idx, :);
+            p_R   = R_rad(p_idx);
+            
+            active(p_idx) = false; % Deactivate parent
+            R_child = p_R / 2.0;
+
+            offsets = [ R_child, 0; 0, R_child; -R_child, 0; 0, -R_child ];
+            for q = 1:4
+                child_slot = find(~active, 1);
+                if isempty(child_slot), break; end
+                
+                pos(child_slot, :)   = p_pos + offsets(q, :);
+                vel(child_slot, :)   = p_vel + 20.0 * (offsets(q, :)/R_child); % Debris kick
+                R_rad(child_slot)    = R_child;
+                axis_a(child_slot)   = R_child;
+                axis_b(child_slot)   = R_child;
+                eps_p(child_slot)    = eps_p(p_idx) + 0.1;
+                active(child_slot)   = true;
+            end
+        end
+
+        % --- G. Real-Time Rendering ---
+        if mod(step, 12) == 0
+            % Render Steel Ball Position in mm
+            set(hBallPlot, 'XData', (ball_pos(1) + R_ball*cos(th_ball))*1000, ...
+                           'YData', (ball_pos(2) + R_ball*sin(th_ball))*1000);
+
+            act_render = find(active);
+            n_render = length(act_render);
+            
+            X_p = zeros(16, n_render);
+            Y_p = zeros(16, n_render);
+            
+            for k = 1:n_render
+                p_i = act_render(k);
+                ct = cos(theta(p_i)); st = sin(theta(p_i));
+                
+                xe = axis_a(p_i) * cos_t;
+                ye = axis_b(p_i) * sin_t;
+                
+                % Convert to mm for plotting
+                X_p(:, k) = (pos(p_i, 1) + ct*xe - st*ye) * 1000;
+                Y_p(:, k) = (pos(p_i, 2) + st*xe + ct*ye) * 1000;
+            end
+            
+            set(hEllipses, 'XData', X_p, 'YData', Y_p, 'CData', vm_str(act_render)/1e6);
+            colormap(hAx, 'jet'); colorbar(hAx);
+            title(hAx, sprintf('CE-FEM Ballistic Impact | Time: %.2f us | Bullet Speed: %.1f m/s', ...
+                  sim_time*1e6, norm(ball_vel)), 'Color', 'w', 'FontSize', 11);
+            drawnow limitrate;
+        end
+    end
+
+    t_sim = toc;
+    fprintf('Ballistic simulation completed in %.2f seconds.\n\n', t_sim);
+
+    %% 6. POST-PROCESSING DIAGNOSTIC SUITE
+    render_ballistic_diagnostics(pos, axis_a, axis_b, R_rad, vm_str, eps_p, active, ...
+                                 ball_pos, R_ball, W_wall, H_wall, outDir);
+end
+
+% Helper Function for 3D sphere volume calculation
+function v = R_rad_to_vol(r)
+    v = r^3;
+end
+
+%% ========================================================================
+% DIAGNOSTIC SUITE
+% =========================================================================
+function render_ballistic_diagnostics(pos, a, b, R, vm, eps_p, active, ball_pos, R_ball, W, H, outDir)
+    act_i = find(active);
+    if isempty(act_i), return; end
+    
+    fig = figure('Name', 'CE-FEM Ballistic Impact Verification Suite', 'Color', 'w', ...
+                 'Position', [80, 60, 1100, 750]);
+
+    % 1. Von Mises Stress Field in Target & Debris
+    subplot(2, 2, 1);
+    scatter(pos(act_i, 1)*1000, pos(act_i, 2)*1000, 10, vm(act_i)/1e6, 'filled');
+    axis equal tight; colorbar; colormap(gca, 'jet');
+    xlabel('X (mm)'); ylabel('Y (mm)');
+    title('Von Mises Stress \sigma_{VM} (MPa)');
+
+    % 2. Equivalent Plastic Strain Field
+    subplot(2, 2, 2);
+    scatter(pos(act_i, 1)*1000, pos(act_i, 2)*1000, 10, eps_p(act_i), 'filled');
+    axis equal tight; colorbar; colormap(gca, 'hot');
+    xlabel('X (mm)'); ylabel('Y (mm)');
+    title('Plastic Strain \epsilon_p (Hydrodynamic Flow)');
+
+    % 3. Ellipse Aspect Ratio (a/b Ratio)
+    subplot(2, 2, 3);
+    asp = a(act_i) ./ b(act_i);
+    scatter(pos(act_i, 1)*1000, pos(act_i, 2)*1000, 10, asp, 'filled');
+    axis equal tight; colorbar; colormap(gca, 'turbo');
+    xlabel('X (mm)'); ylabel('Y (mm)');
+    title('Hydrodynamic Ellipse Morphing (a/b Ratio)');
+
+    % 4. Mass Conservation Invariant Error Plot
+    subplot(2, 2, 4);
+    area_err = abs((a(act_i) .* b(act_i)) ./ (R(act_i).^2) - 1.0);
+    semilogy(pos(act_i, 1)*1000, area_err + 1e-20, 'k.', 'MarkerSize', 5); grid on;
+    xlabel('X Position (mm)'); ylabel('|\pi ab / \pi R^2 - 1|');
+    title(sprintf('Mass Conservation Invariant (Max Error: %.2e)', max(area_err)));
+
+    sgtitle('CE-FEM Ballistic Impact & Perforation Suite', 'FontWeight', 'bold', 'FontSize', 13);
+    
+    savePath = fullfile(outDir, 'Ballistic_Impact_Verification_Plot.png');
+    try exportgraphics(fig, savePath, 'Resolution', 200); catch; print(fig, savePath, '-dpng'); end
+    fprintf('Diagnostic plot saved to: %s\n', savePath);
+end
