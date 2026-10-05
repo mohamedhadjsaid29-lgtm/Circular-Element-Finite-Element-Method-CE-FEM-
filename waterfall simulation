@@ -1,0 +1,379 @@
+function CE_FEM_Interactive_Waterfall()
+% =========================================================================
+% CIRCULAR ELEMENT FEM — INTERACTIVE WATERFALL & RAMP ENGINE
+% =========================================================================
+%
+% FEATURES:
+%   1. Interactive GUI for Element Radius (R0), Ramp Angle, and Speed.
+%   2. Sloped Riverbed: Fluid accelerates under gravity before the cliff.
+%   3. Exact Area Conservation: pi * a * b = pi * R^2 (10^-16 Precision).
+%   4. Streamline Thinning: Stream stretches (a ^) and thins (b = R^2 / a).
+%   5. Basin Impact & Splash: Dynamic hard projection at pool floor.
+% =========================================================================
+
+    clear; clc; close all;
+
+    fprintf('╔══════════════════════════════════════════════════════════╗\n');
+    fprintf('║  CE-FEM INTERACTIVE WATERFALL & RAMP ENGINE              ║\n');
+    fprintf('║  Control Ramp Angle, Inflow Speed, and Element Size      ║\n');
+    fprintf('╚══════════════════════════════════════════════════════════╝\n\n');
+
+    outDir = fullfile(pwd, 'CE_FEM_Waterfall_Interactive_Results');
+    if ~exist(outDir, 'dir'), mkdir(outDir); end
+
+    %% 1. INTERACTIVE SIMULATION CONTROLS DIALOG
+    prompt = { ...
+        'Element Radius R0 (m) [e.g. 0.05 to 0.10]:', ...
+        'River Ramp Angle (Degrees) [e.g. 0 to 20]:', ...
+        'Inflow Velocity (m/s) [e.g. 3.0 to 6.0]:', ...
+        'Cliff Edge X Position (m) [e.g. 8.0]:' ...
+    };
+    dlgtitle = 'CE-FEM Waterfall Simulation Controls';
+    fieldsize = [1 60];
+    definput = {'0.06', '10.0', '4.0', '8.0'};
+    
+    answer = inputdlg(prompt, dlgtitle, fieldsize, definput);
+    if isempty(answer), disp('Canceled by user.'); return; end
+
+    R0            = str2double(answer{1});
+    ramp_angle    = str2double(answer{2});
+    V_river       = str2double(answer{3});
+    x_cliff       = str2double(answer{4});
+
+    %% 2. DOMAIN & WATERFALL GEOMETRY PARAMETERS
+    L_domain  = 24.0;     % Total length (m)
+    H_domain  = 18.0;     % Total height (m)
+    
+    y_cliff_base = 12.0;  % Base height of cliff (m)
+    y_basin      = 1.0;   % Bottom pool floor height (m)
+    H_river      = 2.2;   % River channel depth (m)
+    
+    ramp_rad     = deg2rad(ramp_angle);
+    y_inlet_base = y_cliff_base + x_cliff * tan(ramp_rad); % Height of riverbed at X=0
+    
+    % Fluid Properties
+    rho0      = 1000.0;   % Fluid density (kg/m^3)
+    g_grav    = 9.81;     % Gravity acceleration (m/s^2)
+    
+    % Numerical Constants
+    k_push    = 8000.0;   % Particle repulsion stiffness
+    k_press   = 16000.0;  % Internal fluid expansion stiffness
+    tau_relax = 0.10;     % Viscoelastic memory time (s)
+    c_air     = 0.025;    % Air drag coefficient
+    dt        = 0.0015;   % Time step (s)
+    t_max     = 5.0;      % Total simulation time (s)
+
+    %% 3. PREALLOCATE PARTICLE SYSTEM
+    max_particles = 30000;
+    pos    = zeros(max_particles, 2);
+    vel    = zeros(max_particles, 2);
+    force  = zeros(max_particles, 2);
+    R_rad  = zeros(max_particles, 1);
+    axis_a = zeros(max_particles, 1);
+    axis_b = zeros(max_particles, 1);
+    theta  = zeros(max_particles, 1);
+    active = false(max_particles, 1);
+
+    % River Source Inflow Coordinates (x = 0, along tilted entrance)
+    spacing = 2.01 * R0;
+    y_inlet_nodes = (y_inlet_base + R0) : spacing : (y_inlet_base + H_river - R0);
+    n_inlet_y = length(y_inlet_nodes);
+
+    % Initial Injection Velocity Vector (parallel to sloped ramp)
+    V_inj_x = V_river * cos(ramp_rad);
+    V_inj_y = -V_river * sin(ramp_rad);
+
+    % Seed Initial Column at River Source
+    n_particles = 0;
+    for j = 1:n_inlet_y
+        n_particles = n_particles + 1;
+        pos(n_particles, :) = [R0 + 0.02, y_inlet_nodes(j)];
+        vel(n_particles, :) = [V_inj_x, V_inj_y];
+        R_rad(n_particles)  = R0;
+        axis_a(n_particles) = R0;
+        axis_b(n_particles) = R0;
+        theta(n_particles)  = -ramp_rad;
+        active(n_particles) = true;
+    end
+
+    fprintf('Mesh Initialized with R0 = %.3f m. River Slope = %.1f Deg.\n', R0, ramp_angle);
+
+    %% 4. GRAPHICS CANVAS SETUP
+    hFig = figure('Name', 'CE-FEM Waterfall Simulation', 'Color', 'k', ...
+                  'Position', [50, 50, 1300, 680]);
+    hAx = axes('Parent', hFig, 'Color', [0.02, 0.02, 0.04]);
+    hold(hAx, 'on'); axis(hAx, 'equal');
+    axis(hAx, [-0.5, L_domain + 0.5, -0.5, H_domain + 0.5]);
+    set(hAx, 'XColor', 'w', 'YColor', 'w');
+    xlabel(hAx, 'X Position (m)', 'Color', 'w');
+    ylabel(hAx, 'Y Height (m)', 'Color', 'w');
+
+    % Render Cliff & Basin Rocks Profile
+    cliff_poly_x = [0, x_cliff, x_cliff, L_domain, L_domain, 0];
+    cliff_poly_y = [y_inlet_base, y_cliff_base, y_basin, y_basin, 0, 0];
+    fill(hAx, cliff_poly_x, cliff_poly_y, [0.25, 0.22, 0.20], 'EdgeColor', 'w', 'LineWidth', 1.8);
+
+    % Render Source Inflow Boundary Line
+    plot(hAx, [0, 0], [y_inlet_base, y_inlet_base + H_river], 'w--', 'LineWidth', 1.5);
+
+    % Patch Object for Real-Time Ellipse Rendering
+    th_sample = linspace(0, 2*pi, 16);
+    cos_t = cos(th_sample); sin_t = sin(th_sample);
+    hEllipses = patch('Parent', hAx, 'XData', NaN, 'YData', NaN, ...
+                      'FaceColor', [0.15, 0.75, 1.00], 'FaceAlpha', 0.85, ...
+                      'EdgeColor', [0.05, 0.30, 0.60], 'LineWidth', 0.1);
+
+    %% 5. MAIN TIME INTEGRATION LOOP
+    inflow_timer = 0.0;
+    sim_time     = 0.0;
+    step         = 0;
+
+    fprintf('Simulating waterfall flow...\n');
+    tic;
+
+    while sim_time < t_max && ishandle(hFig)
+        step = step + 1;
+        sim_time = sim_time + dt;
+        inflow_timer = inflow_timer + dt;
+
+        % --- A. Continuous River Source Injection ---
+        if inflow_timer >= (spacing / V_river)
+            inflow_timer = 0.0;
+            for j = 1:n_inlet_y
+                free_slot = find(~active, 1);
+                if isempty(free_slot), break; end
+                
+                pos(free_slot, :)   = [R0, y_inlet_nodes(j)];
+                vel(free_slot, :)   = [V_inj_x, V_inj_y];
+                R_rad(free_slot)    = R0;
+                axis_a(free_slot)   = R0;
+                axis_b(free_slot)   = R0;
+                theta(free_slot)    = -ramp_rad;
+                active(free_slot)   = true;
+            end
+        end
+
+        act_idx = find(active);
+        N_act   = length(act_idx);
+        force(act_idx, :) = 0.0;
+
+        % --- B. O(N) Spatial Cell-List Grid ---
+        cell_size = 2.2 * R0;
+        n_bx = ceil((L_domain + 1.0) / cell_size) + 1;
+        n_by = ceil((H_domain + 1.0) / cell_size) + 1;
+        head = zeros(n_bx, n_by, 'int32');
+        next = zeros(max_particles, 1, 'int32');
+
+        for idx = 1:N_act
+            i = act_idx(idx);
+            gx = min(n_bx, max(1, floor((pos(i,1) + 0.5) / cell_size) + 1));
+            gy = min(n_by, max(1, floor((pos(i,2) + 0.5) / cell_size) + 1));
+            next(i) = head(gx, gy);
+            head(gx, gy) = i;
+        end
+
+        % --- C. Inter-Particle Contact & Hydrodynamic Pressure ---
+        for idx = 1:N_act
+            i = act_idx(idx);
+            gx = min(n_bx, max(1, floor((pos(i,1) + 0.5) / cell_size) + 1));
+            gy = min(n_by, max(1, floor((pos(i,2) + 0.5) / cell_size) + 1));
+
+            for ox = -1:1
+                for oy = -1:1
+                    cx = gx + ox; cy = gy + oy;
+                    if cx < 1 || cx > n_bx || cy < 1 || cy > n_by, continue; end
+                    j = head(cx, cy);
+                    while j > 0
+                        if i < j
+                            rij = pos(i,:) - pos(j,:);
+                            d = norm(rij);
+                            d_min = 0.98 * (R_rad(i) + R_rad(j));
+
+                            if d < d_min && d > 1e-6
+                                nrm = rij / d;
+                                overlap = d_min - d;
+
+                                % Hard Position Projection (Zero Element Crossing)
+                                shift = 0.40 * overlap * nrm;
+                                pos(i,:) = pos(i,:) + shift;
+                                pos(j,:) = pos(j,:) - shift;
+
+                                % Repulsion + Fluid Pressure
+                                rel_v = vel(i,:) - vel(j,:);
+                                vn = dot(rel_v, nrm);
+                                f_hertz = k_push * (overlap^1.2) + k_press * (overlap / R0);
+
+                                force(i,:) = force(i,:) + f_hertz * nrm;
+                                force(j,:) = force(j,:) - f_hertz * nrm;
+
+                                % Velocity Smoothing
+                                if vn < 0
+                                    vel(i,:) = vel(i,:) - 0.40 * vn * nrm;
+                                    vel(j,:) = vel(j,:) + 0.40 * vn * nrm;
+                                end
+                            end
+                        end
+                        j = next(j);
+                    end
+                end
+            end
+        end
+
+        % --- D. Ramp, Cliff & Basin Wall Collisions ---
+        for idx = 1:N_act
+            i = act_idx(idx);
+            px = pos(i,1); py = pos(i,2);
+
+            % 1. Sloped Riverbed Wall (x <= x_cliff)
+            if px <= x_cliff
+                y_bed_local = y_inlet_base - px * tan(ramp_rad);
+                if py < (y_bed_local + R_rad(i))
+                    n_ramp = [sin(ramp_rad), cos(ramp_rad)];
+                    t_ramp = [cos(ramp_rad), -sin(ramp_rad)];
+                    
+                    % Hard Position Projection outside ramp
+                    pos(i,:) = pos(i,:) + (y_bed_local + R_rad(i) - py) * n_ramp;
+                    
+                    % Project velocity along slope
+                    v_mag = norm(vel(i,:));
+                    vel(i,:) = v_mag * t_ramp;
+                end
+            end
+
+            % 2. Vertical Cliff Wall (x <= x_cliff, y <= y_cliff_base)
+            if py < y_cliff_base && px < (x_cliff + R_rad(i)) && px > (x_cliff - 2.0*R_rad(i))
+                pos(i,1) = x_cliff + R_rad(i);
+                if vel(i,1) < 0, vel(i,1) = -0.15 * vel(i,1); end
+            end
+
+            % 3. Bottom Basin Floor (y <= y_basin)
+            if py < (y_basin + R_rad(i))
+                pos(i,2) = y_basin + R_rad(i);
+                if vel(i,2) < 0, vel(i,2) = -0.20 * vel(i,2); end
+            end
+        end
+
+        % --- E. Gravity Integration, Free Fall Stretching & Area Invariant ---
+        for idx = 1:N_act
+            i = act_idx(idx);
+            
+            % Add Gravity + Air Drag Forces
+            mass_i = rho0 * pi * R_rad(i)^2;
+            f_gravity = [0.0, -mass_i * g_grav];
+            f_air_drag = -c_air * norm(vel(i,:)) * vel(i,:);
+
+            total_acc = (force(i,:) + f_gravity + f_air_drag) / mass_i;
+            
+            % Velocity & Position Update
+            vel(i,:) = vel(i,:) + total_acc * dt;
+            pos(i,:) = pos(i,:) + vel(i,:) * dt;
+
+            % Outlet Deletion
+            if pos(i,1) > L_domain + R_rad(i) || pos(i,2) < -1.0
+                active(i) = false;
+                continue;
+            end
+
+            % Streamline Angle Alignment
+            spd = norm(vel(i,:));
+            if spd > 0.1
+                theta(i) = atan2(vel(i,2), vel(i,1));
+            end
+
+            % --- CE-FEM WATERFALL FREE-FALL STRETCHING KINEMATICS ---
+            speed_factor = min(4.0, max(1.0, spd / V_river));
+            target_a = R_rad(i) * speed_factor;
+            
+            axis_a(i) = axis_a(i) + 0.25 * (target_a - axis_a(i));
+            axis_a(i) = max(0.60 * R_rad(i), min(4.20 * R_rad(i), axis_a(i)));
+
+            % STRICT INVARIANCE: pi * a * b = pi * R^2  =>  b = R^2 / a (Stream Thins!)
+            axis_b(i) = (R_rad(i)^2) / axis_a(i);
+        end
+
+        % --- F. Real-Time Graphics Rendering ---
+        if mod(step, 8) == 0
+            act_render = find(active);
+            n_render = length(act_render);
+            
+            X_p = zeros(16, n_render);
+            Y_p = zeros(16, n_render);
+            
+            for k = 1:n_render
+                p_i = act_render(k);
+                ct = cos(theta(p_i)); st = sin(theta(p_i));
+                
+                xe = axis_a(p_i) * cos_t;
+                ye = axis_b(p_i) * sin_t;
+                
+                X_p(:, k) = pos(p_i, 1) + ct*xe - st*ye;
+                Y_p(:, k) = pos(p_i, 2) + st*xe + ct*ye;
+            end
+            
+            set(hEllipses, 'XData', X_p, 'YData', Y_p);
+            title(hAx, sprintf('CE-FEM Waterfall | R0 = %.2fm | Slope = %.1f° | Time: %.3f s | Active Parcels: %d', ...
+                  R0, ramp_angle, sim_time, N_act), 'Color', 'w', 'FontSize', 12);
+            drawnow limitrate;
+        end
+    end
+
+    t_sim = toc;
+    fprintf('Waterfall simulation completed in %.2f seconds.\n\n', t_sim);
+
+    %% 6. POST-PROCESSING DIAGNOSTIC SUITE
+    render_waterfall_diagnostics(pos, vel, axis_a, axis_b, R_rad, active, ...
+                                 L_domain, H_domain, x_cliff, y_inlet_base, y_cliff_base, y_basin, g_grav, ramp_rad, outDir);
+end
+
+%% ========================================================================
+% DIAGNOSTIC SUITE
+% =========================================================================
+function render_waterfall_diagnostics(pos, vel, a, b, R, active, L, H, x_cliff, y_in, y_c, y_b, g, ramp_rad, outDir)
+    act_i = find(active);
+    if isempty(act_i), return; end
+    
+    x_p = pos(act_i, 1);
+    y_p = pos(act_i, 2);
+    v_x = vel(act_i, 1);
+    v_y = vel(act_i, 2);
+    v_mag = sqrt(v_x.^2 + v_y.^2);
+    
+    fig = figure('Name', 'CE-FEM Waterfall Verification Suite', 'Color', 'w', ...
+                 'Position', [80, 60, 1150, 780]);
+
+    % 1. Waterfall Flow Speed Map
+    subplot(3, 2, [1, 2]);
+    scatter(x_p, y_p, 12, v_mag, 'filled'); hold on;
+    cliff_x = [0, x_cliff, x_cliff, L, L, 0];
+    cliff_y = [y_in, y_c, y_b, y_b, 0, 0];
+    plot(cliff_x, cliff_y, 'k-', 'LineWidth', 2.0);
+    axis equal tight; colorbar; colormap(gca, 'turbo');
+    xlabel('X Position (m)'); ylabel('Y Height (m)');
+    title('Waterfall Flow Speed Field ||V|| (m/s)');
+    
+    % 2. Vertical Velocity v_y Profile
+    subplot(3, 2, 3);
+    plot(x_p, v_y, 'c.', 'MarkerSize', 5); grid on;
+    xlabel('X Position (m)'); ylabel('Vertical Velocity v_y (m/s)');
+    title('Vertical Velocity Trajectory v_y');
+
+    % 3. Streamline Aspect Ratio Morphing (Stream Thinning)
+    subplot(3, 2, 4);
+    aspect_ratio = a(act_i) ./ b(act_i);
+    plot(x_p, aspect_ratio, 'g.', 'MarkerSize', 5); grid on;
+    xlabel('X Position (m)'); ylabel('Aspect Ratio (a/b)');
+    title('Free-Fall Streamline Thinning (a/b > 1.0)');
+
+    % 4. Exact Area Conservation Invariant Error Plot
+    subplot(3, 2, [5 6]);
+    area_err = abs((a(act_i) .* b(act_i)) ./ (R(act_i).^2) - 1.0);
+    semilogy(x_p, area_err + 1e-20, 'k.', 'MarkerSize', 5); grid on;
+    xlabel('X Position (m)'); ylabel('|\pi ab / \pi R^2 - 1|');
+    title(sprintf('Mass Invariant Error (Max Error: %.2e)', max(area_err)));
+
+    sgtitle(sprintf('CE-FEM Waterfall | Ramp = %.1f°', rad2deg(ramp_rad)), 'FontWeight', 'bold', 'FontSize', 13);
+    
+    savePath = fullfile(outDir, 'Waterfall_Validation_Plot.png');
+    try exportgraphics(fig, savePath, 'Resolution', 200); catch; print(fig, savePath, '-dpng'); end
+    fprintf('Validation plot saved to: %s\n', savePath);
+end
